@@ -1,0 +1,584 @@
+From cee269aff45702e9e6253a2dc53f56120e514086 Mon Sep 17 00:00:00 2001
+From: Timothy Rule <tim.rule.git@nym.hush.com>
+Date: Sun, 4 May 2014 10:38:55 +0200
+Subject: [PATCH] WIP patch for SENUI usb to i2c
+
+---
+ drivers/usb/misc/Kconfig  |   9 +
+ drivers/usb/misc/Makefile |   1 +
+ drivers/usb/misc/senui.c  | 531 ++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 541 insertions(+)
+ create mode 100644 drivers/usb/misc/senui.c
+
+diff --git a/drivers/usb/misc/Kconfig b/drivers/usb/misc/Kconfig
+index 55660ea..097b0cf 100644
+--- a/drivers/usb/misc/Kconfig
++++ b/drivers/usb/misc/Kconfig
+@@ -206,6 +206,15 @@ config USB_IOWARRIOR
+ 
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called iowarrior.
++	  
++config USB_SENUI
++	tristate "Sensirion USB to I2C Master driver support"
++	depends on USB && I2C
++	help
++	  Say Y here if you want to support the Sensirion USB to I2C Dongle.
++	  
++	  To compile this driver as a module, choose M here: the
++	  module will be called senui.
+ 
+ config USB_TEST
+ 	tristate "USB testing driver"
+diff --git a/drivers/usb/misc/Makefile b/drivers/usb/misc/Makefile
+index 717703e..d11b16a 100644
+--- a/drivers/usb/misc/Makefile
++++ b/drivers/usb/misc/Makefile
+@@ -12,6 +12,7 @@ obj-$(CONFIG_USB_EMI62)		+= emi62.o
+ obj-$(CONFIG_USB_FTDI_ELAN)	+= ftdi-elan.o
+ obj-$(CONFIG_USB_IDMOUSE)	+= idmouse.o
+ obj-$(CONFIG_USB_IOWARRIOR)	+= iowarrior.o
++obj-$(CONFIG_USB_SENUI)	    += senui.o
+ obj-$(CONFIG_USB_ISIGHTFW)	+= isight_firmware.o
+ obj-$(CONFIG_USB_LCD)		+= usblcd.o
+ obj-$(CONFIG_USB_LD)		+= ldusb.o
+diff --git a/drivers/usb/misc/senui.c b/drivers/usb/misc/senui.c
+new file mode 100644
+index 0000000..a7a8565
+--- /dev/null
++++ b/drivers/usb/misc/senui.c
+@@ -0,0 +1,531 @@
++/*
++ * Sensirion USB to I2C Master
++ *
++ * Copyright (C) 2014 Timothy Rule (tim.github@nym.hush.com)
++ * 
++ * based on
++ * 
++ * usb-senuieton.c by Greg Kroah-Hartman  <greg@kroah.com>
++ * iowarrior.c by Christian Lucht <lucht@codemercs.com>
++ *
++ * Released under the GPLv2.
++ */
++
++#include <linux/kernel.h>
++#include <linux/errno.h>
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/usb.h>
++#include <linux/slab.h>
++#include <linux/i2c.h>
++#include <linux/mutex.h>
++
++
++/* Sensirion USB to I2C dongle is based in iowarrior IOW24 */
++#define USB_SENUI_VENDOR_ID		0x07c0
++#define USB_SENUI_PRODUCT_ID	0x158a
++
++
++/* table of devices that work with this driver */
++static const struct usb_device_id senui_table[] = {
++	{ USB_DEVICE(USB_SENUI_VENDOR_ID, USB_SENUI_PRODUCT_ID) },
++	{ }					/* Terminating entry */
++};
++MODULE_DEVICE_TABLE(usb, senui_table);
++
++
++#define REPORT_SIZE					8
++
++#define READ_BUFFER_SIZE			256
++
++#define STATUS_IDLE					0
++#define STATUS_XFER					1
++#define STATUS_WRITE_DONE			2
++
++/* Use our own dbg macro */
++#undef dbg
++#define dbg( format, arg... ) do { err( format "" , ## arg ); } while ( 0 )
++
++
++
++/* Structure to hold I2C Adapter information. */
++struct usb_senui_i2c {
++	struct i2c_adapter	adapter;
++};
++
++struct senui_usb_report
++{
++	unsigned char		report_id;
++#define CMD_I2C_CTRL					0x01
++#define CMD_I2C_WRITE					0x02
++#define CMD_I2C_READ					0x03
++	unsigned char		bytes[7];
++#define CMD_I2C_CTRL_ENABLE				0x01
++#define CMD_I2C_CTRL_BUSON 				0x80
++};
++
++/* Structure to hold all of our device specific stuff */
++struct usb_senui {
++	struct mutex 		mutex;			/* locks this structure */
++	struct mutex		mutex_xfer;
++	struct usb_device 	*udev;		/* save off the usb device pointer */
++	struct usb_interface *interface;	/* the interface for this device */
++	struct usb_endpoint_descriptor *int_in_endpoint;	/* endpoint for reading */
++
++	struct urb 			*int_in_urb;		/* the urb for reading data */
++	unsigned char 		int_in_buffer[REPORT_SIZE];	/* buffer for data to be read */
++
++	unsigned char		read_buffer[READ_BUFFER_SIZE];
++	atomic_t	 		read_idx;
++	spinlock_t 			read_idx_lock;
++	wait_queue_head_t 	read_wait;
++	
++	int					status;
++	
++	int 				present;			/* this is 1 as long as the device is connected */
++	char 				chip_serial[9];		/* the serial number string of the chip connected */
++	u16 				product_id;
++	
++	struct usb_senui_i2c i2c;
++	struct senui_usb_report report;
++};
++
++static struct usb_driver senui_driver;
++
++#define USB_REQ_SET_REPORT 0x09
++static int usb_set_report(struct usb_interface *intf, unsigned char type,
++                          unsigned char id, void *buf, int size)
++{
++	char *buf1 = buf;
++	dbg("%s - entry, report: pipe:        %08x", __func__, usb_sndctrlpipe(interface_to_usbdev(intf), 0));
++	dbg("%s - entry, report: request:     %02x", __func__, USB_REQ_SET_REPORT);
++	dbg("%s - entry, report: requesttype: %02x", __func__, 0x22);
++	dbg("%s - entry, report: value:       %04x", __func__,(type << 8) + id);
++	dbg("%s - entry, report: index:       %04x", __func__,intf->cur_altsetting->desc.bInterfaceNumber);
++	dbg("%s - entry, report: %02x %02x %02x %02x %02x %02x %02x", __func__,
++		buf1[0], buf1[1], buf1[2]
++		, buf1[3], buf1[4], buf1[5], buf1[6]
++	);
++	
++        return usb_control_msg(interface_to_usbdev(intf),
++                               usb_sndctrlpipe(interface_to_usbdev(intf), 0),
++                               USB_REQ_SET_REPORT,
++                               0x22,//USB_TYPE_CLASS | USB_RECIP_INTERFACE,
++                               (type << 8) + id,
++                               intf->cur_altsetting->desc.bInterfaceNumber, buf,
++                               size, HZ);
++}
++
++
++static void senui_delete(struct usb_senui *dev)
++{
++	dbg("%s - entry", __func__);
++	
++	i2c_del_adapter(&dev->i2c.adapter); // FIXME not sure if robust when I2C was NOT added.
++	usb_free_urb(dev->int_in_urb);
++	kfree(dev);
++}
++
++static inline void senui_reset_read_vars(struct usb_senui *dev)
++{
++	dbg("%s - entry", __func__);
++	
++	atomic_set(&dev->read_idx, 0);
++}
++
++static inline void senui_set_status(struct usb_senui *dev, int status)
++{
++	mutex_lock(&dev->mutex);
++	dev->status = status;
++	mutex_unlock(&dev->mutex);
++}
++
++static void senui_callback(struct urb *urb)
++{
++	struct usb_senui *dev = urb->context;
++	struct senui_usb_report *report = urb->transfer_buffer;
++	int retval;
++	int index;
++	int size;
++	
++	dbg("%s - entry, report: %02x %02x %02x %02x %02x %02x %02x %02x", __func__,
++		report->report_id, report->bytes[0], report->bytes[1], report->bytes[2]
++		, report->bytes[3], report->bytes[4], report->bytes[5], report->bytes[6]
++	);
++	
++	switch (urb->status) {
++	case 0:
++		break;
++	case -ECONNRESET:
++	case -ENOENT:
++	case -ESHUTDOWN:
++		return;
++	default:
++		goto exit;
++	}
++	
++	/* LOCK */
++	spin_lock(&dev->read_idx_lock);
++	
++	switch (report->report_id) {
++	case CMD_I2C_WRITE:
++		senui_set_status(dev, STATUS_WRITE_DONE);
++		break;
++		
++	case CMD_I2C_READ:
++		size = report->bytes[0];
++		if (size > 6)
++			goto exit_notify; // too much data, must be in error, notify caller, set a status???
++			
++		index = atomic_read(&dev->read_idx);
++		if (index + size >= READ_BUFFER_SIZE) {
++			size = READ_BUFFER_SIZE - index - 1; // only partial buffer will be copied
++		}
++		memcpy(dev->read_buffer + index, &report->bytes[1], size);
++		atomic_set(&dev->read_idx, index + size);
++	
++	default:
++		break;
++	}
++	
++	/* UNLOCK */
++	spin_unlock(&dev->read_idx_lock);
++	
++	/* Notify any blocking reads that data is available. */
++exit_notify:	
++	wake_up_interruptible(&dev->read_wait);
++	
++exit:
++	retval = usb_submit_urb(urb, GFP_ATOMIC);
++	if (retval)
++		dev_err(&dev->interface->dev, "%s - usb_submit_urb failed with result %d\n",
++			__func__, retval);
++}
++
++static int senui_i2c_write(struct usb_senui *dev, struct i2c_msg *msg)
++{
++	int retval;
++	struct senui_usb_report *report = &(dev->report);
++	int r;
++	
++	dbg("%s - entry", __func__);
++	
++	if (msg->len > 5) {
++		err("write size limited to 5 bytes");
++		retval = -EINVAL;
++		goto exit;
++	}
++	
++	senui_reset_read_vars(dev);
++		
++	/* Send the write request. */
++	memset(report, 0x00, sizeof(struct senui_usb_report));
++	report->report_id 	= CMD_I2C_WRITE;
++	report->bytes[0] 	= ((msg->len + 1) & 0x0f) | 0xc0; // bytes, limit len to 15, mask in xc0 (no idea why)
++	report->bytes[1] 	= msg->addr << 1;
++	memcpy(&(report->bytes[2]), msg->buf, msg->len);
++				
++	retval = usb_set_report(dev->interface, 2, CMD_I2C_WRITE, (char *)report, 
++							sizeof(struct senui_usb_report));
++							
++	/* Wait for the incomming data, interrupt driven. */
++	r = wait_event_timeout(dev->read_wait, 
++			(dev->status == STATUS_WRITE_DONE), 
++			msecs_to_jiffies(1000));
++	if (r == 0) {
++		// FIXME timeout ... return NACK/NODEV
++		dbg("%s - .. timeout, status is %d", __func__, dev->status);
++		retval = -ENODEV;
++		goto exit;
++	}
++	if (!dev->present) {
++		dbg("%s - .. removed", __func__);
++		retval = -ENODEV;
++		goto exit;
++	}
++
++	retval = 0; // FIXME right now don't care about response content, could be in intr_write_done.
++
++exit:	
++	return retval;
++}
++
++static int senui_i2c_read(struct usb_senui *dev, struct i2c_msg *msg)
++{
++	int retval;
++	struct senui_usb_report *report = &(dev->report);
++	int r;
++	
++	dbg("%s - entry", __func__);
++	
++	
++	senui_reset_read_vars(dev);
++	
++	/* Send the read request. */
++	memset(report, 0x00, sizeof(struct senui_usb_report));
++	report->report_id 	= CMD_I2C_READ;
++	report->bytes[0] 	= msg->len + 1;
++	report->bytes[1] 	= (msg->addr << 1) | 0x01;
++
++	retval = usb_set_report(dev->interface, 2, CMD_I2C_READ, (char *)report, 
++							sizeof(struct senui_usb_report));
++
++	/* Wait for the incomming data, interrupt driven. */
++	r = wait_event_timeout(dev->read_wait, 
++			((atomic_read(&dev->read_idx) + 1) == msg->len), 
++			msecs_to_jiffies(1000));
++	if (r == 0) {
++		// FIXME timeout ... return NACK/NODEV
++		retval = -ENODEV;
++		goto exit;
++	}
++	if (!dev->present) {
++		retval = -ENODEV;
++		goto exit;
++	}
++	
++	memcpy(msg->buf, dev->read_buffer, msg->len);
++	
++	retval = 0; // FIXME right now don't care about response content, could be in intr_write_done.
++
++exit:	
++	return retval;
++}
++
++static void senui_i2c_bus_on(struct usb_senui *dev)
++{
++	int retval;
++	struct senui_usb_report *report = &(dev->report);
++	
++	dbg("%s - entry", __func__);
++	
++	senui_reset_read_vars(dev);
++	
++	memset(report, 0x00, sizeof(struct senui_usb_report));
++	report->report_id 	= CMD_I2C_CTRL;
++	report->bytes[0] 	= CMD_I2C_CTRL_ENABLE;
++	report->bytes[1] 	= CMD_I2C_CTRL_BUSON;
++	
++	retval = usb_set_report(dev->interface, 2, CMD_I2C_CTRL, (char *)report, 
++							sizeof(struct senui_usb_report));
++							
++	/* Wait for the incomming data, interrupt driven ???? need this ??? */
++}
++
++static int senui_i2c_xfer(struct i2c_adapter *adapter,
++				struct i2c_msg *msgs, int num)
++{
++	int retval = 0;
++	struct usb_senui *dev;
++	int i;
++	
++	dbg("%s - entry", __func__);
++	
++	dev = i2c_get_adapdata(adapter);
++	if (!dev) {
++		err("could not find usb_senui device in i2c adapter");
++		retval = -ENODEV;
++		goto exit;
++	}
++	
++	/* Lock the device so that one xfer runs at a time per dev. */
++	mutex_lock(&dev->mutex_xfer);
++	senui_set_status(dev, STATUS_XFER);
++	
++	/* Send the i2c messages. */
++	for (i = 0; i < num; i++) {
++		if (msgs[i].flags & I2C_M_RD)
++			retval = senui_i2c_read(dev, &msgs[i]);
++		else
++			retval = senui_i2c_write(dev, &msgs[i]);
++		if (retval)
++			break;
++		if (!dev->present)
++			break;
++	}
++	
++	senui_set_status(dev, STATUS_IDLE);
++	mutex_unlock(&dev->mutex_xfer);
++exit:
++
++	return retval;
++}
++
++static u32 senui_i2c_func(struct i2c_adapter *adapter)
++{
++	 return I2C_FUNC_I2C | I2C_FUNC_SMBUS_BYTE | 
++				I2C_FUNC_SMBUS_BYTE_DATA | I2C_FUNC_SMBUS_WORD_DATA;
++}
++
++static struct i2c_algorithm senui_i2c_algo = {
++	.master_xfer	= senui_i2c_xfer,
++	.functionality	= senui_i2c_func,
++};
++
++static int senui_probe(struct usb_interface *interface,
++		      const struct usb_device_id *id)
++{
++	struct usb_senui *dev;
++	struct usb_host_interface *iface_desc;
++	struct usb_endpoint_descriptor *endpoint;
++	int i;
++	int retval = -ENOMEM;
++	
++	dbg("%s - entry", __func__);
++
++	/* Allocate memory for our device state and initialize it. */
++	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
++	if (!dev) {
++		err("Out of memory");
++		goto error;
++	}
++	
++	mutex_init(&dev->mutex);
++	mutex_init(&dev->mutex_xfer);
++	spin_lock_init(&dev->read_idx_lock);
++	init_waitqueue_head(&dev->read_wait);
++	dev->udev = usb_get_dev(interface_to_usbdev(interface));
++	dev->interface = interface;
++	dev->product_id = le16_to_cpu(dev->udev->descriptor.idProduct);
++
++	/* Set up the endpoint information. */
++	iface_desc = interface->cur_altsetting;
++	for (i = 0; i < iface_desc->desc.bNumEndpoints; ++i) {
++		endpoint = &iface_desc->endpoint[i].desc;
++		
++		if (usb_endpoint_is_int_in(endpoint))
++			dev->int_in_endpoint = endpoint;
++	}
++	if (!dev->int_in_endpoint) {
++		err("Could not find int-in endpoint");
++		goto error;
++	}
++	
++	/* Check the report_size is 8. Other sizes could be possible but not supported ATM. */
++	if (le16_to_cpu(dev->int_in_endpoint->wMaxPacketSize) != REPORT_SIZE) {
++		err("Report size is not supported, should be 8");
++		goto error;
++	}
++	
++	/* create the urb and buffer for reading */
++	dev->int_in_urb = usb_alloc_urb(0, GFP_KERNEL);
++	if (!dev->int_in_urb) {
++		dev_err(&interface->dev, "Couldn't allocate interrupt_in_urb\n");
++		goto error;
++	}
++
++	usb_fill_int_urb(dev->int_in_urb, dev->udev,
++			 usb_rcvintpipe(dev->udev, dev->int_in_endpoint->bEndpointAddress),
++			 dev->int_in_buffer, REPORT_SIZE,
++			 senui_callback, dev, dev->int_in_endpoint->bInterval);
++
++
++	/* Get the serial-number of the chip. */
++	memset(dev->chip_serial, 0x00, sizeof(dev->chip_serial));
++	usb_string(dev->udev, dev->udev->descriptor.iSerialNumber, dev->chip_serial,
++		   sizeof(dev->chip_serial));
++	if (strlen(dev->chip_serial) != 8)
++		memset(dev->chip_serial, 0x00, sizeof(dev->chip_serial));
++
++	/* Set the idle timeout to 0, if this is interface 0 */
++	if (dev->interface->cur_altsetting->desc.bInterfaceNumber == 0) {
++		usb_control_msg(dev->udev, usb_sndctrlpipe(dev->udev, 0),
++				0x0A,
++				USB_TYPE_CLASS | USB_RECIP_INTERFACE, 0,
++				0, NULL, 0, USB_CTRL_SET_TIMEOUT);
++	}
++
++
++
++	/* Lets waiting functions know if the device was disconnected. */
++	dev->present = 1;
++
++	/* Save the data pointer in the interface device. */
++	usb_set_intfdata(interface, dev);
++		 
++	/* Register this driver with the I2C subsystem. */
++	strcpy(dev->i2c.adapter.name, "SENUI I2C Master driver");
++	dev->i2c.adapter.owner 	= THIS_MODULE;
++	dev->i2c.adapter.algo 	= &senui_i2c_algo;
++	i2c_set_adapdata(&dev->i2c.adapter, dev);
++	
++	retval = i2c_add_adapter(&dev->i2c.adapter);
++	if (retval)
++	{
++		err("i2c_add_adapter failed. Error number %d", retval);
++		goto error;
++	}
++	
++	/* Turn the i2c bus on. */
++	senui_i2c_bus_on(dev);
++	
++	
++	/* Report which node this device is now attached to. */
++	dev_info(&interface->dev, "SENUI product=0x%x, serial=%s "
++		 "interface=%d now attached to %s\n", dev->product_id,
++		 dev->chip_serial, iface_desc->desc.bInterfaceNumber, 
++		 dev_name(&dev->i2c.adapter.dev));
++		
++	return 0;
++
++error:
++	senui_delete(dev);
++	return retval;
++}
++
++static void senui_disconnect(struct usb_interface *interface)
++{
++	struct usb_senui *dev;
++	
++	dbg("%s - entry", __func__);
++	
++	
++	dev = usb_get_intfdata(interface);
++	usb_set_intfdata(interface, NULL);
++
++	/* prevent device read, write and ioctl */
++	mutex_lock(&dev->mutex);
++	dev->present = 0;
++	mutex_unlock(&dev->mutex);
++	
++	/* Wait for any inflight operations to finish, then delete. */
++	mutex_lock(&dev->mutex_xfer); // prevent new operations
++	senui_delete(dev);
++	
++	dev_info(&interface->dev, "USB SENUI now disconnected");
++}
++
++static struct usb_driver senui_driver = {
++	.name =		"senui",
++	.probe =	senui_probe,
++	.disconnect =	senui_disconnect,
++	.id_table =	senui_table,
++};
++
++static int __init usb_senui_init(void)
++{
++	int result;
++	
++	dbg("%s - XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", __func__);
++	dbg("%s - XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", __func__);
++	dbg("%s - XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", __func__);
++	dbg("%s - entry", __func__);
++
++	/* Register this driver with the USB subsystem. */
++	result = usb_register(&senui_driver);
++	if (result)
++		err("usb_register failed. Error number %d", result);
++
++	return result;
++}
++
++static void __exit usb_senui_exit(void)
++{
++	/* deregister this driver with the USB subsystem */
++	usb_deregister(&senui_driver);
++}
++
++module_init(usb_senui_init);
++module_exit(usb_senui_exit);
++
++MODULE_LICENSE("GPL");
+-- 
+1.8.3.2
+
