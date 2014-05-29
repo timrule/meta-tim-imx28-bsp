@@ -10,4 +10,3 @@ IMAGE_INSTALL += " \
 "
 
 export IMAGE_BASENAME = "tim-image-imx28-bsp"
-

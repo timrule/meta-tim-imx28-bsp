@@ -10,11 +10,6 @@ LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda
 
 PR = "r0"
 
-#include recipes-fsl/images/fsl-image-gui.bb
-#IMAGE_INSTALL += " \
-#        can-bus \
-#"
-
 inherit update-rc.d
 
 INITSCRIPT_NAME = "can-bus"
@@ -23,6 +18,7 @@ INITSCRIPT_PARAMS = "start 45 S . stop 45 0 6 1 ."
 SRC_URI = "file://init"
 
 do_install () {
+	install -d ${D}${sysconfdir}/init.d
 	install -m 0755 ${WORKDIR}/init ${D}${sysconfdir}/init.d/can-bus
 }
 

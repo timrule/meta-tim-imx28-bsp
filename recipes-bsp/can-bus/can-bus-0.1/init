@@ -3,8 +3,12 @@
 case "$1" in
 start)
 	echo -n "Configuring can busses... "
+	ifconfig can0 down
+	ifconfig can1 down
 	echo 125000 > /sys/devices/platform/FlexCAN.0/bitrate
 	echo 125000 > /sys/devices/platform/FlexCAN.1/bitrate
+	ifconfig can0 up
+	ifconfig can1 up
 	echo "done."
 	;;
 
