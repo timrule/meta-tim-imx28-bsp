@@ -1,0 +1,20 @@
+#!/bin/sh -e
+
+case "$1" in
+start)
+	echo -n "Configuring can busses... "
+	echo 125000 > /sys/devices/platform/FlexCAN.0/bitrate
+	echo 125000 > /sys/devices/platform/FlexCAN.1/bitrate
+	echo "done."
+	;;
+
+stop)
+	;;
+
+*)
+	echo "Usage: /etc/init.d/can-bus {start|stop}"
+	exit 1
+	;;
+esac
+
+exit 0
