@@ -10,10 +10,10 @@ LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda
 
 PR = "r0"
 
-#require fsl-image-gui.bb
-IMAGE_INSTALL += " \
-        can-bus \
-"
+#include recipes-fsl/images/fsl-image-gui.bb
+#IMAGE_INSTALL += " \
+#        can-bus \
+#"
 
 inherit update-rc.d
 
